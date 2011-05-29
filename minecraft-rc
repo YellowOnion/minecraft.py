@@ -1,0 +1,47 @@
+#!/bin/bash
+
+. /etc/rc.conf
+. /etc/rc.d/functions
+
+case "$1" in
+  start)
+    stat_busy "Starting minecraft-server"
+    if $(ck_daemon minecraft-server); then
+      cd /srv/minecraft
+      twistd -l minecraft.log -u minecraft -g minecraft -y minecraft.py
+    fi
+    if [ $? -gt 0 ]; then
+      stat_fail
+    else
+      add_daemon minecraft-server
+      stat_done
+    fi
+    ;;
+  stop)
+    
+    stat_busy "Stopping minecraft-server"
+    pidfile="/srv/minecraft/twistd.pid"
+    [ -e $pidfile ] && kill $(cat /srv/minecraft/twistd.pid)
+    if [ $? -gt 0 ] ; then
+      stat_fail
+    else
+      rm_daemon minecraft-server
+      while [ -e $pidfile ]; do
+        sleep 1;
+      done
+      stat_done
+    fi
+    ;;
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  status)
+    stat_busy 'Checking minecraft-server status'
+    ck_status minecraft-server
+    ;;
+  *)
+    echo "usage: $0 {start|stop|restart|status}"
+esac
+exit 0
