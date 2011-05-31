@@ -15,8 +15,6 @@ class LineEventer(basic.LineReceiver):
     delimiter = '\n'
     service = None
     cmd_deffered = None
-    saving = None
-    backingup = None
     
     def connectionMade(self):
         self.ops = [ x[:-1].lower() for x in open(os.path.join(run_dir, 'ops.txt'))\
@@ -31,8 +29,10 @@ class LineEventer(basic.LineReceiver):
         
         self.re_events = [
                 (re.compile(r'issued server command: (.+)'), self.cmd),
-#                (re.compile(r'Forceing save..'), self.forcing_save),
-                (re.compile(r'Save complete.'), self.save_complete),
+#                (re.compile(r'Forcing save\.\.'), self.forcing_save),
+                (re.compile(r'Save complete\.'), self.save_complete),
+                (re.compile(r'lost connection: disconnect\.(.+)'), self.player_disconnect),
+                (re.compile(r'.+logged in.+'), self.player_connect),
                 ]
 
     def lineReceived(self, line):
@@ -55,14 +55,17 @@ class LineEventer(basic.LineReceiver):
                         d.addErrback(error)
                         d.callback(match)
                         break
+
+    def player_connect(self, match, player):
+        self.service.player_connect(player)
+        
+
+    def player_disconnect(self, match, player):
+        reason = match.group(1)
+        self.service.player_disconnect(player, reason)
     
     def save_complete(self, match, player):
-        print 'function save_complete called'
-        if self.saving:
-            print 'saving deferred'
-            self.saving.callback('done')           
-        else:
-            print 'saving deferred missing OH KNOW!'
+        self.service.save_complete()
 
     def cmd(self, match, player):
             if match:
@@ -100,36 +103,8 @@ class LineEventer(basic.LineReceiver):
         self.minecraft.say(player + ' issued command to backup')
         
         if player in self.ops:
-            self.saving = defer.Deferred()
-            self.minecraft.save_off()
-            self.minecraft.save_all()
-
-            def finished(ignore):
-                print 'tar exited with code', ignore
-                self.saving = None
-                self.backingup = None
-                self.minecraft.save_on()
-
-            def backup(ignore):
-                if not self.backingup:
-                    print 'spawning tar'
-                    d = self.backingup = utils.getProcessOutputAndValue('/bin/tar',
-                            args=['-cjf',
-                                'backups/minecraft_' + \
-                                        time.strftime('%F.%T%z') + \
-                                        '.tar.bz2',
-                                'poly'],
-                        env=os.environ,
-                        path=self.service.run_dir)
-                    d.addCallback(finished)
-                else:
-                    self.minecraft.say('already backing up!')
-
-            def failed_backup(err):
-                self.minecraft.say('backup failed')
-                err.printTraceback()
-
-            self.saving.addCallbacks(backup, failed_backup)
+            self.service.backup()
+            
         
     
 class DummyTransport:
@@ -229,8 +204,11 @@ class MinecraftService(service.Service):
     eventer = None
     time_started = 0
     threshold = 1 # secounds
-    minecraft_proc = None
+    minecraft = None
     stopping_deferred = None
+    saving = None
+    backingup = None
+    playing = {}
 
     def __init__(self, run_dir):
         self.run_dir = run_dir
@@ -243,12 +221,12 @@ class MinecraftService(service.Service):
     def stopService(self):
         service.Service.stopService(self)
         self.active = 0
-        self.minecraft_proc.stop()
+        self.minecraft.stop()
         d = self.stopping_deferred = defer.Deferred()
         return d
 
     def start_minecraft(self):
-        p = self.minecraft_proc = MinecraftProtocol()
+        p = self.minecraft = MinecraftProtocol()
         p.service = self
         self.time_started = time.time()
         reactor.spawnProcess(p, '/usr/bin/minecraft-server',
@@ -266,6 +244,77 @@ class MinecraftService(service.Service):
         else:
             print 'service stopping not restarting Minecraft'
             self.stopping_deferred.callback(None)
+        
+
+    def backup(self):
+        try:
+            world = self.world
+        except AttributeError:
+               
+            props_file = open(os.path.join(self.run_dir,
+                'server.properties'))
+            for line in props_file.readlines():
+                if line.startswith('level-name'):
+                    world = self.world = line.split('=')[1].strip()
+
+        backup_dir = os.path.join(self.run_dir, 'backups')
+
+        if not os.path.exists(backup_dir):
+            os.mkdir(backup_dir)
+
+        bu_dir_pre = os.path.join(backup_dir, 'minecraft_')
+
+        self.saving = defer.Deferred()
+        self.minecraft.save_off()
+        self.minecraft.save_all()
+            
+        def finished(ignore):
+            print 'tar exited with code', ignore
+            self.saving = None
+            self.backingup = None
+            self.minecraft.say('backup complete')
+            self.minecraft.save_on()
+
+        def backup(ignore):
+            if not self.backingup:
+                print 'spawning tar'
+                d = self.backingup = \
+                        utils.getProcessOutputAndValue('/bin/tar',
+                        args=['-cjf',
+                            bu_dir_pre + \
+                                    time.strftime('%F.%T%z') + \
+                                    '.tar.bz2',
+                            world],
+                    env=os.environ,
+                    path=self.run_dir)
+                d.addCallbacks(finished, failed_backup)
+            else:
+                self.minecraft.say('already backing up!')
+
+        def failed_backup(err):
+            self.minecraft.say('backup failed')
+            err.printTraceback()
+
+        return self.saving.addCallbacks(backup, failed_backup)
+
+    def save_complete(self):
+        print 'function save_complete called'
+        if self.saving:
+            print 'saving deferred'
+            self.saving.callback('done')           
+        else:
+            print 'saving deferred missing OH NO!'
+
+    def player_disconnect(self, player, reason):
+        print 'player disconnected:', player, reason
+        self.playing[player].callback(reason)
+        del self.playing[player]
+        if not self.playing:
+            self.backup()
+
+    def player_connect(self, player):
+        print 'player connected:', player
+        self.playing[player] = defer.Deferred()
 
 
 run_dir = os.path.dirname(__file__)
